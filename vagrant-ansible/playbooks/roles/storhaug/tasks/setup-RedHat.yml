@@ -1,0 +1,4 @@
+---
+- name: Install Storhaug
+  yum: pkg=storhaug-glusterfs,storhaug-glusterfs-smb state=present
+

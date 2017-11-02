@@ -1,0 +1,278 @@
+---
+# file: storhaug-glusterfs.yml
+- hosts: ha_servers
+  name: Initializing
+  become: yes
+
+  tasks:
+    - name: Detect guest OS family
+      group_by: key={{ ansible_os_family }}
+      changed_when: False
+
+    - name: Set hostname
+      hostname: "name={{ inventory_hostname }}{% if ad['domain'] is defined and ad['domain'] %}.{{ ad['domain'] }}{% endif %}"
+
+    - name: Disable SELinux
+      selinux: state=disabled
+
+    - name: Create extra disk partitions
+      shell: "{ blkid | grep -q /dev/{{item[0].dev}}{{item[1].num}} && echo FOUND; } || { parted /dev/{{item[0].dev}} mklabel msdos && parted /dev/{{item[0].dev}} mkpart primary 512 {{item[1].size}}; }"
+      register: part_result
+      changed_when: "'FOUND' not in part_result.stdout"
+      with_subelements:
+        - "{{extra_disks}}"
+        - parts
+      when: extra_disks is defined
+
+    - name: Create extra disk filesystems
+      filesystem: fstype={{item[1].fs}} dev=/dev/{{item[0].dev}}{{item[1].num}}
+      with_subelements:
+        - "{{extra_disks}}"
+        - parts
+      when: extra_disks is defined
+
+    - name: Mount extra disk filesystems
+      mount: name={{item[1].mount}} src=/dev/{{item[0].dev}}{{item[1].num}} fstype={{item[1].fs}} state=mounted
+      with_subelements:
+        - "{{extra_disks}}"
+        - parts
+      when: extra_disks is defined
+
+- hosts: RedHat
+  name: Server Setup (RedHat)
+  become: yes
+  gather_facts: False
+
+  tasks:
+#    - include: roles/common/tasks/setup-RedHat.yml
+#    - include: roles/glusterfs/tasks/setup-RedHat.yml
+#      when: gluster['setup_gluster']
+
+- hosts: none
+  name: Server Setup (Common)
+  become: yes
+
+  roles:
+    - common
+
+  vars:
+    - firewall_services:
+      - ssh
+      - glusterfs
+      - samba
+      - samba-client
+      - nfs
+      - high-availability
+    - firewall_ports:
+      - '4379/tcp'
+    - firewall_interfaces:
+      - 'eth0'
+      - 'eth1'
+
+  tasks:
+    - name: Disable SELinux
+      selinux: state=disabled
+
+- hosts: gluster_servers:smb_servers
+  name: GlusterFS Setup
+  become: yes
+
+  roles:
+    - { role: glusterfs, when: "gluster['setup_gluster'] is defined and gluster['setup_gluster']" }
+
+  vars:
+    - gluster_default_cluster: "{%- for host in groups['gluster_servers'] -%}{{hostvars[host]['ansible_hostname']}}{% if not loop.last %},{% endif %}{%- endfor -%}"
+    - gluster_default_replica: "{{ 3 if groups['gluster_servers']|count >= 3 else (2 if groups['gluster_servers']|count == 2 else omit) }}"
+    - gluster_default_bricks:  1
+
+  tasks:
+    - name: Generate bricks list
+      set_fact:
+        bricks: >-
+            {%- for volume in gluster['volumes'] -%}
+              {%- set cluster = gluster_default_cluster if 'cluster' not in volume.iterkeys() else volume.cluster -%}
+              {% if ansible_hostname in cluster.split(',') or ( ansible_ib0 is defined and ansible_ib0['ipv4']['address'] in cluster.split(',') ) -%}
+                {%- set bricks = gluster_default_bricks if 'bricks' not in volume.iterkeys() else volume.bricks -%}
+                {%- if(bricks|int) and bricks > 0 -%}
+                  {%- for i in range(bricks) -%}
+                    {{ volume.name }}{{ i }}{% if not loop.last %},{% endif %}
+                  {%- endfor -%}
+                {%- elif bricks|list -%}
+                  {%- for brick in bricks -%}
+                    {{ brick }}{% if not loop.last %},{% endif %}
+                  {%- endfor -%}
+                {%- endif -%}
+                {%- if not loop.last %},{% endif -%}
+              {%- endif %}
+            {% endfor %}
+      when: gluster['setup_gluster'] is defined and gluster['setup_gluster']
+
+#    - debug: msg="bricks {{ bricks.split(',') }}"
+#      failed_when: true
+
+    - name: Ensure Gluster brick directories exist.
+      file: "path={{ [gluster['bricks_dir'], item]|join('/') if item[0] != '/' else item }} state=directory mode=0775"
+      with_items: "{% if bricks is defined and bricks %}{{ bricks.split(',') if ',' in bricks else [ bricks ]}}{% else %}{{ [ '' ] }}{% endif %}"
+      when: "gluster['setup_gluster'] is defined and gluster['setup_gluster'] and item"
+
+    - name: Probe Samba peers
+      command: gluster peer probe {{ item }}
+      with_items: "{{ groups['smb_servers'] }}"
+      run_once: true
+      when: "'gluster_servers' in group_names"
+      register: probe_result
+      changed_when: "'already' not in probe_result.stdout and 'localhost' not in probe_result.stdout"
+
+    - name: Configure Gluster volumes.
+      gluster_volume:
+        state: present
+        name: "{{ item.name }}"
+        bricks: >-
+          {% set bricks = gluster_default_bricks if 'bricks' not in item.iterkeys() else item.bricks -%}
+          {%- if (bricks|int) and bricks > 0 -%}
+            {%- for i in range(bricks) -%}
+              {{ [gluster['bricks_dir'], item.name]|join('/') }}{{ i }}{% if not loop.last %},{% endif %}
+            {%- endfor -%}
+          {%- elif bricks|list -%}
+            {%- for brick in bricks -%}
+              {% if brick[0] != "/" %}{{ gluster['bricks_dir'] }}/{% endif %}{{ brick }}{% if not loop.last %},{% endif %}
+            {%- endfor -%}
+          {%- else -%}
+            {{ omit }}
+          {%- endif %}
+        replicas: >-
+          {% if item.replica is defined and item.replica == 'n' -%}
+            {{ groups['gluster_servers']|count if groups['gluster_servers']|count > 1 else omit }}
+          {%- elif item.replica is defined and item.replica == 0 -%}
+            {{ omit }}
+          {%- elif groups['gluster_servers']|count >= (item.replica | default(gluster_default_replica)) -%}
+            {{ item.replica | default(gluster_default_replica) }}
+          {%- else -%}
+            {{ omit }}
+          {%- endif %}
+        cluster: "{{ item.cluster | default(gluster_default_cluster) }}"
+        options: "{{ item.opts|default(omit) }}"
+        transport: "{{ item.transport|default(omit) }}"
+        force: yes
+      run_once: true
+      delegate_to: "{{ groups['gluster_servers'][0] }}"
+      when: gluster['setup_gluster'] is defined and gluster['setup_gluster']
+      with_items: "{{ gluster['volumes'] }}"
+      register: result
+      until: result|success
+      retries: 3
+
+    - name: Start Gluster volumes.
+      gluster_volume:
+        name: "{{ item.name }}"
+        state: started
+      run_once: true
+      when: gluster['setup_gluster'] is defined and gluster['setup_gluster']
+      with_items: "{{ gluster['volumes'] }}"
+
+    - name: Set volume permissions
+      shell: "mount -t glusterfs localhost:/{{ item.name }} /mnt && chmod -c {{ item.root_mode|default('777') }} /mnt; umount /mnt"
+      with_items: "{{ gluster['volumes'] }}"
+      run_once: true
+      when: gluster['setup_gluster'] is defined and gluster['setup_gluster']
+      register: perms_result
+      changed_when: "'changed' in perms_result.stdout"
+
+    - name: Rebalance volumes (for lookup optimization)
+      shell: "gluster volume rebalance {{ item.name }} status | grep -q completed || gluster volume rebalance {{ item.name }} start"
+      when: "gluster['setup_gluster'] is defined and gluster['setup_gluster'] and 'bricks' in item.iterkeys() and ( ( (item.bricks|int) and item.bricks > 0 ) or ( item.bricks|list and item.bricks|length > 0 ) )"
+      with_items: "{{ gluster['volumes'] }}"
+      run_once: true
+      ignore_errors: true
+
+    - name: Verify rebalance complete
+      shell: "gluster volume rebalance {{ item.name }} status"
+      when: "gluster['setup_gluster'] is defined and gluster['setup_gluster'] and 'bricks' in item.iterkeys() and ( ( (item.bricks|int) and item.bricks > 0 ) or ( item.bricks|list and item.bricks|length > 0 ) )"
+      with_items: "{{ gluster['volumes'] }}"
+      run_once: true
+      register: rebal
+      until: "'completed' in rebal.stdout"
+      ignore_errors: true
+
+    - name: Mount volumes
+      mount: name={{item.mount}} src=localhost:/{{item.name}} fstype=glusterfs opts=defaults,_netdev state=mounted
+      with_items: "{{ gluster['volumes'] }}"
+      when: "item['mount'] is defined"
+      register: result
+      until: result|success
+
+- hosts: smb_servers
+  name: Server Setup (SMB)
+  become: yes
+
+#  roles:
+#    - samba
+
+  tasks:
+    - name: Copy CTDB config files
+      template: src={{item.src}} dest={{item.dest}} owner=root group=root mode=0744
+      with_items:
+        - { src: "{% if ctdb['config_file'] is defined and ctdb['config_file'] %}{{ ctdb['config_file'] }}{% else %}files/ctdb{% endif %}", dest: '/etc/sysconfig/ctdb' }
+        - { src: 'files/nodes.j2', dest: '/etc/ctdb/nodes' }
+      when: ctdb['setup_ctdb'] is defined and ctdb['setup_ctdb']
+
+    - name: Copy Samba config files
+      template: src={{item.src}} dest={{item.dest}} owner=root group=root mode=0744
+      with_items:
+        - { src: "{% if samba['config_file'] is defined and samba['config_file'] %}{{ samba['config_file'] }}{% else %}files/smb.conf.j2{% endif %}", dest: '/etc/samba/smb.conf' }
+      when: samba['setup_samba'] is defined and samba['setup_samba']
+
+    - name: Ensure share directories exist
+      file: "path={{ samba['shares'][item]['path'] }} state=directory mode=0777"
+      with_items: "{{ samba['shares'] }}"
+      when: "samba['setup_samba'] is defined and samba['setup_samba'] and item and ('glusterfs:volume' not in samba['shares'][item].keys())"
+
+- hosts: nfs_servers
+  name: Server Setup (NFS)
+  become: yes
+
+  tasks:
+    - name: Copy Ganesha config files
+      template: src={{item.src}} dest={{item.dest}} owner=root group=root mode=0744
+      with_items:
+        - { src: "files/ganesha.conf", dest: '/etc/ganesha/ganesha.conf' }
+        - { src: "files/nfs", dest: '/etc/sysconfig/nfs' }
+      when: ganesha['setup_ganesha'] is defined and ganesha['setup_ganesha']
+
+- hosts: ad_server
+  name: Active Directory Setup
+  become: yes
+
+  tasks:
+    - include: roles/storhaug-glusterfs/tasks/setup-AD.yml
+      when: ad['setup_ad'] is defined and ad['setup_ad']
+
+- hosts: ha_servers
+  name: Storhaug Configuration and Initialization
+  become: yes 
+
+#  roles:
+#    - storhaug-glusterfs
+
+  tasks:
+    - name: Copy Storhaug config files
+      template: src={{item.src}} dest={{item.dest}} owner=root group=root mode=0744
+      with_items:
+        - { src: 'files/storhaug-glusterfs.conf.j2', dest: '/etc/sysconfig/storhaug-glusterfs.conf' }
+        - { src: 'files/CTDB', dest: '/usr/lib/ocf/resource.d/heartbeat/CTDB' }
+
+    - name: Ensure SSH directory exists
+      file: "path=/root/.ssh state=directory mode=0700"
+
+    - name: Copy SSH access files
+      template: src={{item.src}} dest={{item.dest}} owner=root group=root mode=0700
+      with_items:
+        - { src: 'files/vagrant.pub', dest: '/root/.ssh/authorized_keys' }
+        - { src: 'files/vagrant', dest: '/etc/sysconfig/storhaug-glusterfs.d/secret.pem' }
+
+    - name: Teardown any pre-existing cluster.
+      shell: pcs cluster stop; pcs cluster destroy
+
+#    - name: Start Storhaug
+#      shell: storhaug-glusterfs setup
+#      run_once: true
